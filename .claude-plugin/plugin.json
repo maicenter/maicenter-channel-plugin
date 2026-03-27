@@ -1,0 +1,8 @@
+{
+  "name": "maicenter-channel",
+  "description": "mAICenter channel — receive and reply to messages from mAICenter web dashboard. Agents can be controlled via maicenter.org just like Telegram.",
+  "author": {
+    "name": "ldx",
+    "url": "https://maicenter.org"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "maicenter",
+  "version": "0.1.0",
+  "description": "mAICenter channel plugin for OpenClaw — chat with your agents from maicenter.org",
+  "license": "Apache-2.0",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "setupEntry": "./dist/setup-entry.js",
+    "channel": {
+      "id": "maicenter",
+      "label": "mAICenter",
+      "blurb": "Connect OpenClaw to mAICenter web dashboard."
+    },
+    "install": {
+      "defaultChoice": "path",
+      "minHostVersion": ">=2026.3.22"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3"
+  }
+}

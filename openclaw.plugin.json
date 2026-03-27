@@ -1,0 +1,24 @@
+{
+  "id": "maicenter",
+  "kind": "channel",
+  "channels": ["maicenter"],
+  "name": "mAICenter",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "agentKey": {
+        "type": "string",
+        "description": "mAICenter agent API key (sk_agent_...)"
+      },
+      "pollInterval": {
+        "type": "number",
+        "description": "Polling interval in seconds (default: 30)"
+      },
+      "activePollInterval": {
+        "type": "number",
+        "description": "Active polling interval in seconds (default: 3)"
+      }
+    }
+  }
+}
