@@ -94,10 +94,19 @@ If your OpenClaw agent uses a self-hosted LLM on a **private network IP** (e.g. 
 
 1. **Move the LLM to a public hostname** (recommended for security): put it behind a reverse proxy with a real domain + TLS (e.g. `llm.your-domain.com`), update the OpenClaw provider config to use that URL. SSRF policy stays intact.
 
-2. **Add an allowlist exception for the local LLM host**. OpenClaw exposes two narrow scopes:
-   - `tools.web.fetch.ssrfPolicy` — controls the agent's own `web_fetch` tool.
-   - `browser.ssrfPolicy` — controls browser/network fetches.
-   The exact key for the **LLM provider transport** varies by version; consult `openclaw config schema` and search for `ssrfPolicy`. Many setups also accept tightly scoped flags like `allowRfc2544BenchmarkRange` (for fake-IP proxies such as Clash/Surge) or `allowIpv6UniqueLocalRange`. Keep the allowlist minimal — wide-open SSRF policies put your agent at risk of being tricked into hitting your internal services.
+2. **Allow private-network requests for the one LLM provider only** (narrow scope, no global SSRF disable):
+
+   ```bash
+   # find your provider id (whatever key sits under models.providers in your config)
+   openclaw config get models.providers
+   # then allow it
+   openclaw config set models.providers.<your_provider_id>.request.allowPrivateNetwork true
+   # restart gateway to pick it up
+   launchctl stop ai.openclaw.gateway && launchctl start ai.openclaw.gateway
+   # systemd:  systemctl --user restart openclaw
+   ```
+
+   This whitelists **only that provider's HTTP fetches** — your `web_fetch` tool, browser, other providers, and other plugins all stay protected by the default SSRF policy. Revert with `openclaw config delete models.providers.<your_provider_id>.request.allowPrivateNetwork`.
 
 If you're on a cloud LLM (OpenAI, Anthropic, Google, etc.) you'll never hit this — those are public IPs.
 

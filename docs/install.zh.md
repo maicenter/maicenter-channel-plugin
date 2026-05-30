@@ -94,10 +94,19 @@ nanoclaw config set http.allowed_domains '["api.maicenter.org"]'
 
 1. **把 LLM 搬到公网域名**（推荐，更安全）：放反向代理后挂域名 + TLS（如 `llm.your-domain.com`），更新 OpenClaw provider 配置指向这个 URL。SSRF 策略保持原样。
 
-2. **加 allowlist 例外** 让本地 LLM 通过。OpenClaw 有两个细粒度作用域：
-   - `tools.web.fetch.ssrfPolicy` —— 控制 agent 自己的 `web_fetch` 工具
-   - `browser.ssrfPolicy` —— 控制浏览器/网络请求
-   **LLM provider transport** 的具体 key 因版本而异，跑 `openclaw config schema` 搜 `ssrfPolicy` 查最新。部分场景可用窄范围开关如 `allowRfc2544BenchmarkRange`（给 Clash/Surge 类伪 IP 代理用）或 `allowIpv6UniqueLocalRange`。**保持 allowlist 尽量小** —— 过度放宽会让 agent 被诱导去打你内网服务。
+2. **只给这一个 LLM provider 开放私网请求**（窄作用域，不全局禁用 SSRF）：
+
+   ```bash
+   # 查你 provider 的 id（models.providers 下的 key）
+   openclaw config get models.providers
+   # 加白名单
+   openclaw config set models.providers.<你的_provider_id>.request.allowPrivateNetwork true
+   # 重启 gateway
+   launchctl stop ai.openclaw.gateway && launchctl start ai.openclaw.gateway
+   # systemd: systemctl --user restart openclaw
+   ```
+
+   这条**只放行这一个 provider** 的 HTTP fetch，你的 `web_fetch` 工具、浏览器、其他 provider、其他插件仍受默认 SSRF 保护。回滚：`openclaw config delete models.providers.<你的_provider_id>.request.allowPrivateNetwork`。
 
 如果你用云 LLM（OpenAI、Anthropic、Google 等公网），完全不会撞这个问题。
 

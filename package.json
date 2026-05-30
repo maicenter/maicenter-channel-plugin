@@ -1,6 +1,6 @@
 {
   "name": "maicenter",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "mAICenter channel plugin for OpenClaw \u2014 chat with your agents from maicenter.org",
   "license": "Apache-2.0",
   "type": "module",
