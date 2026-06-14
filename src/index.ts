@@ -1,7 +1,7 @@
 // mAICenter channel plugin for OpenClaw
 // Polls mAICenter web dashboard messages and dispatches to agent via gateway pipeline
 
-import { createMaicenterPolling, sendReply } from './channel.js';
+import { createMaicenterPolling, sendReply, reportModelCatalog } from './channel.js';
 
 function listMaicenterAccountIds(cfg: any): string[] {
   if (cfg?.channels?.maicenter?.agentKey) return ['default'];
@@ -94,6 +94,17 @@ const maicenterPlugin: any = {
       ctx.log?.info?.(`[${account.accountId}] starting maicenter channel polling`);
       ctx.setStatus?.({ accountId: account.accountId, running: true, lastStartAt: Date.now(), lastEventAt: Date.now() });
 
+      // Report the local model catalog so mAICenter can show it on the agent
+      // profile page and let the owner share specific models. Fire-and-forget;
+      // re-report every hour in case config changed.
+      const reportNow = () => reportModelCatalog(ctx.cfg, account.agentKey).then((r) => {
+        if (r.error) ctx.log?.error?.(`[maicenter] model report error: ${r.error}`);
+        else ctx.log?.info?.(`[maicenter] reported ${r.count} models`);
+      }).catch((e: any) => ctx.log?.error?.(`[maicenter] model report failed: ${e?.message || e}`));
+      reportNow();
+      const reportTimer = setInterval(reportNow, 60 * 60 * 1000);
+      if (typeof (reportTimer as any).unref === 'function') (reportTimer as any).unref();
+
       const stop = createMaicenterPolling(ctx, account.agentKey, {
         pollInterval: (account.pollInterval || 30) * 1000,
         activePollInterval: (account.activePollInterval || 3) * 1000,
@@ -103,6 +114,7 @@ const maicenterPlugin: any = {
         if (ctx.abortSignal) {
           ctx.abortSignal.addEventListener('abort', () => {
             stop();
+            clearInterval(reportTimer);
             ctx.setStatus?.({ accountId: account.accountId, running: false });
             resolve();
           });
@@ -117,7 +129,11 @@ const maicenterPlugin: any = {
   allowlist: {},
   bindings: {},
   groups: {},
-  actions: {},
+  actions: {
+    // Returns null = "no special tool schema for messages on this channel".
+    // Required to be a function — OpenClaw's describeMessageToolSafely calls it.
+    describeMessageTool: () => null,
+  },
   directory: {},
   execApprovals: {},
 };

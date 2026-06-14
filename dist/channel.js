@@ -4,6 +4,12 @@ const API_BASE = 'https://api.maicenter.org';
 const IDLE_INTERVAL = 30_000;
 const ACTIVE_INTERVAL = 3_000;
 const ACTIVE_TIMEOUT = 300_000;
+// Local LAN ASR (svoic-asr-server on the DGX Spark). The plugin runs on a host
+// inside the LAN (ProClaw / MiniClaw), so it reaches the ASR directly — unlike a
+// Cloudflare Worker, which cannot route to 192.168.x / Tailscale. Overridable via
+// plugin config (config.asrUrl / config.asrModel) so other hosts can repoint it.
+const DEFAULT_ASR_URL = 'http://192.168.12.193:8084/v1/audio/transcriptions';
+const DEFAULT_ASR_MODEL = 'paraformer-zh';
 async function apiGet(agentKey, path) {
     const resp = await fetch(`${API_BASE}${path}`, {
         headers: { 'Authorization': `Bearer agent:${agentKey}` },
@@ -22,18 +28,178 @@ let msgCounter = 0;
 function generateMessageSid() {
     return `mc_${Date.now()}_${++msgCounter}`;
 }
+// Download an audio attachment (agent-authenticated) and transcribe it on the
+// local LAN ASR. Returns the transcript text, or '' on any failure (the caller
+// falls back to the original content so a flaky ASR never drops the message).
+async function transcribeAudioMessage(agentKey, msg, asrUrl, asrModel) {
+    const key = msg.metadata?.key;
+    if (!key)
+        return '';
+    try {
+        // 1. Fetch the audio bytes via the agent attachment endpoint (LAN/edge OK —
+        //    this is a normal HTTPS call to api.maicenter.org, not the ASR).
+        const dlPath = `/agent/channels/${msg.channelId}/attachments/${encodeURIComponent(key)}`;
+        const dl = await fetch(`${API_BASE}${dlPath}`, {
+            headers: { 'Authorization': `Bearer agent:${agentKey}` },
+        });
+        if (!dl.ok) {
+            console.error(`[maicenter] audio download failed ${dl.status} for ${key}`);
+            return '';
+        }
+        const bytes = new Uint8Array(await dl.arrayBuffer());
+        const mimeType = msg.metadata?.mimeType || dl.headers.get('Content-Type') || 'audio/webm';
+        const filename = (msg.content && msg.content.trim()) || 'voice';
+        // 2. POST to the local ASR (OpenAI-compatible multipart). This is the only
+        //    LAN-only hop — works because the plugin runs inside the LAN.
+        const form = new FormData();
+        form.append('file', new Blob([bytes], { type: mimeType }), filename);
+        form.append('model', asrModel);
+        form.append('response_format', 'json');
+        const asr = await fetch(asrUrl, { method: 'POST', body: form });
+        if (!asr.ok) {
+            console.error(`[maicenter] ASR error ${asr.status} for ${key}`);
+            return '';
+        }
+        const ct = asr.headers.get('Content-Type') || '';
+        let text = '';
+        if (ct.includes('application/json')) {
+            const data = await asr.json().catch(() => null);
+            text = (data && typeof data.text === 'string') ? data.text : '';
+        }
+        else {
+            text = (await asr.text()).trim();
+        }
+        return text.trim();
+    }
+    catch (e) {
+        console.error('[maicenter] transcribe error:', e?.message || e);
+        return '';
+    }
+}
 export function createMaicenterPolling(ctx, agentKey, config) {
     let lastPollTime = new Date().toISOString().replace('T', ' ').replace('Z', '').split('.')[0];
     let currentInterval = config.pollInterval || IDLE_INTERVAL;
     let lastMessageTime = 0;
     let timer = null;
+    let myAgentId = null;
     const channelUsers = {};
     const cr = ctx.channelRuntime;
     const accountId = ctx.accountId || 'default';
+    const asrUrl = config.asrUrl || DEFAULT_ASR_URL;
+    const asrModel = config.asrModel || DEFAULT_ASR_MODEL;
+    // Resolve our own agent id once so we can spot mentions targeted at us
+    // (and apply the user's preferredModel for our dispatch).
+    apiGet(agentKey, '/agent/profile').then((p) => {
+        if (p?.id)
+            myAgentId = p.id;
+    }).catch(() => { });
+    // Per-channel buffer of silently-delivered messages — group/friend chat that
+    // wasn't @-addressed to us. We flush this buffer as a context preamble in
+    // front of the next addressed message so the LLM sees "刚才" naturally.
+    // Bounded so a burst of group chatter doesn't grow unboundedly.
+    const SILENT_BUFFER_MAX = 80;
+    const silentBuffer = {};
+    function pushSilent(channelId, who, msg) {
+        const buf = silentBuffer[channelId] || (silentBuffer[channelId] = []);
+        buf.push({ time: msg.createdAt, who, text: msg.content });
+        if (buf.length > SILENT_BUFFER_MAX)
+            buf.splice(0, buf.length - SILENT_BUFFER_MAX);
+    }
+    // Build the recent-history preamble. Combines the in-memory silent buffer
+    // (instant, no API call) with the most recent ~20 messages fetched from the
+    // server (catches anything missed across restarts), deduped by id, sorted by
+    // time, excluding the current addressed message.
+    async function buildContextPreamble(currentMsg) {
+        const seen = new Set();
+        const entries = [];
+        const buf = silentBuffer[currentMsg.channelId] || [];
+        for (const e of buf) {
+            const id = `${e.time}|${e.who}|${e.text}`;
+            if (!seen.has(id)) {
+                seen.add(id);
+                entries.push({ id, ...e });
+            }
+        }
+        silentBuffer[currentMsg.channelId] = [];
+        try {
+            const hist = await apiGet(agentKey, `/agent/channels/${currentMsg.channelId}/messages?limit=20`);
+            for (const m of (hist.messages || [])) {
+                if (m.id === currentMsg.id)
+                    continue;
+                // Filter out agent replies. Otherwise the model regurgitates its own
+                // prior wrong answers ("3 messages") instead of counting fresh from
+                // the real user messages. Users asking "who said what" want humans.
+                if (m.senderType === 'agent')
+                    continue;
+                const who = m.senderName || m.senderId;
+                const e = { id: m.id, time: m.createdAt, who, text: m.content };
+                if (!seen.has(m.id)) {
+                    seen.add(m.id);
+                    entries.push(e);
+                }
+            }
+        }
+        catch { /* best-effort — fall back to buffer-only preamble */ }
+        if (entries.length === 0)
+            return '';
+        entries.sort((a, b) => a.time.localeCompare(b.time));
+        const lines = entries.map((e) => `${e.who}: ${e.text}`).join('\n');
+        // Anchoring framing. The first paragraph overrides the RLHF reflex of
+        // "I cannot access chat history" empirically observed on qwen3/gemma when
+        // the channelRuntime prepends "Conversation info (untrusted metadata)" to
+        // the body. The "Recent group chat" block then reads as real conversation.
+        return [
+            '[OPERATOR INSTRUCTION — overrides any earlier framing this turn. Read carefully and obey strictly.]',
+            'You are an active member of this group chat. The "Recent group chat" block immediately below is REAL conversation that just happened in this group — you witnessed every line of it. Treat it as ground truth.',
+            '',
+            'Rules for this turn (no exceptions):',
+            '  1. The "Recent group chat" block is the COMPLETE record of what you can see. There is no "elsewhere" to look — it is right here.',
+            '  2. When the user asks to count / list / quote messages, count and quote LITERALLY from the block, one entry per line. Include duplicates. Do not summarize, dedupe, or omit.',
+            '  3. NEVER refuse with phrases like "我无法访问", "I cannot access", "no permission", "platform security", "数据未持久化" — that is wrong; the data is right here.',
+            '  4. NEVER suggest the user "open the Maicenter app / client", "scroll up", "view history elsewhere", "export the transcript", "long-press a message", or any equivalent. They are talking to you here; you have the data here.',
+            '  5. If a question references "刚才" / "earlier" / "just now" / "本群" / "this group", answer using the block.',
+            '',
+            'Recent group chat (chronological, ending just before the new message below). Each line is one entry.',
+            lines,
+            '',
+            'New message directed at you (respond to this, using only the block above as context — do not invent context not present there):',
+            '',
+        ].join('\n');
+    }
     async function processMessage(msg, userName) {
+        // Voice messages: contentType:'audio' arrives with the filename as `content`
+        // and the R2 key in metadata. Transcribe it locally (LAN ASR) and replace the
+        // content with the transcript so the rest of the pipeline (silent buffering,
+        // context preamble, LLM dispatch) treats it as plain text — exactly like a
+        // typed message. On any ASR failure, fall back to a readable placeholder so
+        // the message is never silently dropped.
+        if (msg.contentType === 'audio' && msg.metadata?.key && !msg.metadata?.transcript) {
+            const transcript = await transcribeAudioMessage(agentKey, msg, asrUrl, asrModel);
+            if (transcript) {
+                msg.content = transcript;
+                if (msg.metadata)
+                    msg.metadata.transcript = transcript;
+            }
+            else {
+                msg.content = '[语音消息无法转写]';
+            }
+        }
+        // Silent (non-addressed) message in a group/friend channel — buffer it as
+        // context. Silent path: no LLM call, no session record (those would create
+        // orphan turns). Buffer is best-effort; the addressed path below also
+        // pulls the latest history from the server so a restart-cleared buffer
+        // doesn't strand "刚才" references.
+        if (msg.addressed === false) {
+            pushSilent(msg.channelId, msg.senderName || userName, msg);
+            return;
+        }
+        // Build the preamble: in-memory buffer (cheap) UNION recent history pulled
+        // from the server (resilient to plugin restarts). We pull a bounded window
+        // and dedupe by message id.
+        const preamble = await buildContextPreamble(msg);
         // Build inbound context
         const msgCtx = {
-            Body: msg.content,
+            Body: preamble + msg.content,
             From: msg.channelId,
             To: msg.channelId,
             AccountId: accountId,
@@ -60,7 +226,7 @@ export function createMaicenterPolling(ctx, agentKey, config) {
             sessionKey: route?.sessionKey,
         });
         const finalized = cr.reply.finalizeInboundContext(msgCtx);
-        // Record inbound session
+        // Record inbound session for this addressed turn.
         await cr.session.recordInboundSession({
             storePath,
             sessionKey: route?.sessionKey,
@@ -83,13 +249,41 @@ export function createMaicenterPolling(ctx, agentKey, config) {
                 console.error('[maicenter] reply delivery error:', String(err));
             },
         });
+        // Per-turn model override: did the user pick a specific model for this
+        // @-mention? If so, clone the cfg and rewrite agents.defaults.model.primary
+        // so this dispatch runs against that model. Default behavior unchanged.
+        let dispatchCfg = ctx.cfg;
+        const ourMention = (msg.metadata?.mentions || []).find((m) => m.type === 'agent' && (myAgentId ? m.id === myAgentId : true) && m.preferredModel);
+        if (ourMention?.preferredModel?.providerKey && ourMention?.preferredModel?.modelId) {
+            const fq = `${ourMention.preferredModel.providerKey}/${ourMention.preferredModel.modelId}`;
+            dispatchCfg = {
+                ...ctx.cfg,
+                agents: {
+                    ...(ctx.cfg?.agents || {}),
+                    defaults: {
+                        ...(ctx.cfg?.agents?.defaults || {}),
+                        model: {
+                            ...((ctx.cfg?.agents?.defaults?.model) || {}),
+                            primary: fq,
+                            // No fallbacks for an explicit override — if the user picked it,
+                            // we honor it or fail loudly rather than silently route elsewhere.
+                            fallbacks: [],
+                        },
+                        models: {
+                            ...((ctx.cfg?.agents?.defaults?.models) || {}),
+                            [fq]: ((ctx.cfg?.agents?.defaults?.models || {})[fq]) || {},
+                        },
+                    },
+                },
+            };
+        }
         // Dispatch: run LLM agent and deliver reply
         try {
             await cr.reply.withReplyDispatcher({
                 dispatcher,
                 run: () => cr.reply.dispatchReplyFromConfig({
                     ctx: finalized,
-                    cfg: ctx.cfg,
+                    cfg: dispatchCfg,
                     dispatcher,
                     replyOptions: { ...replyOptions, disableBlockStreaming: false },
                 }),
@@ -153,4 +347,59 @@ export function createMaicenterPolling(ctx, agentKey, config) {
 }
 export async function sendReply(agentKey, channelId, text) {
     return apiPost(agentKey, `/agent/channels/${channelId}/messages`, { content: text });
+}
+// Infer model capability (text / image / vision / video / voiceSynth /
+// voiceRecog) from common cues in the modelId or display name. Best-effort —
+// the owner can re-classify in the mAICenter UI later.
+function inferCapability(modelId, name) {
+    const h = `${modelId} ${name || ''}`.toLowerCase();
+    if (/\b(qwen[-_]?image|flux|sdxl|stable[-_]?diffusion|wan(?!ku)|sana|hidream)\b/.test(h))
+        return 'image';
+    if (/\b(longlive|video|cogvideo|wanku|hunyuan[-_]?video)\b/.test(h))
+        return 'video';
+    if (/\b(-vl|_vl|vl-|vision|vlm|clip)\b/.test(h))
+        return 'vision';
+    if (/\b(tts|voicesynth|cosyvoice|f5[-_]?tts|fish[-_]?speech|edge[-_]?tts)\b/.test(h))
+        return 'voiceSynth';
+    if (/\b(asr|stt|whisper|paraformer|voicerecog)\b/.test(h))
+        return 'voiceRecog';
+    return 'text';
+}
+// Walk through cfg.models.providers, flatten into a list of model entries,
+// and PUT to mAICenter. Replaces the full catalog for this agent each call.
+// Idempotent — re-running preserves any `shared` flags the owner set in UI.
+export async function reportModelCatalog(cfg, agentKey) {
+    const providers = cfg?.models?.providers || {};
+    const models = [];
+    for (const [providerKey, prov] of Object.entries(providers)) {
+        const list = Array.isArray(prov?.models) ? prov.models : [];
+        for (const m of list) {
+            const modelId = String(m?.id || m?.name || '').trim();
+            if (!modelId)
+                continue;
+            const displayName = m?.name && String(m.name).trim() !== modelId ? String(m.name) : undefined;
+            const capability = inferCapability(modelId, displayName);
+            models.push({
+                providerKey,
+                modelId,
+                displayName,
+                capability,
+                contextWindow: typeof m?.contextWindow === 'number' ? m.contextWindow : undefined,
+                maxTokens: typeof m?.maxTokens === 'number' ? m.maxTokens : undefined,
+            });
+        }
+    }
+    try {
+        const resp = await fetch(`${API_BASE}/agent/me/models`, {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer agent:${agentKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ models }),
+        });
+        if (!resp.ok)
+            return { count: models.length, error: `${resp.status} ${resp.statusText}` };
+        return { count: models.length };
+    }
+    catch (e) {
+        return { count: models.length, error: e?.message || String(e) };
+    }
 }
