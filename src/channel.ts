@@ -46,6 +46,8 @@ interface MaicenterMessage {
     // Set by us after a successful local transcription so we don't re-transcribe
     // the same message if it reappears in a poll window (and for debugging).
     transcript?: string;
+    // Per-model transcripts written back to the server so humans can read them.
+    transcripts?: Record<string, { text: string; at: string }>;
   };
 }
 
@@ -77,21 +79,23 @@ function generateMessageSid(): string {
   return `mc_${Date.now()}_${++msgCounter}`;
 }
 
-// Download an audio attachment (agent-authenticated) and transcribe it on the
-// local LAN ASR. Returns the transcript text, or '' on any failure (the caller
-// falls back to the original content so a flaky ASR never drops the message).
-async function transcribeAudioMessage(
+// Download an audio attachment (agent-authenticated) by R2 key and transcribe it
+// on the local LAN ASR with the given model. Returns the transcript text, or ''
+// on any failure (callers fall back so a flaky ASR never drops the message).
+async function transcribeAudioByKey(
   agentKey: string,
-  msg: MaicenterMessage,
+  channelId: string,
+  key: string,
+  filenameHint: string,
+  mimeHint: string | undefined,
   asrUrl: string,
   asrModel: string,
 ): Promise<string> {
-  const key = msg.metadata?.key;
   if (!key) return '';
   try {
     // 1. Fetch the audio bytes via the agent attachment endpoint (LAN/edge OK —
     //    this is a normal HTTPS call to api.maicenter.org, not the ASR).
-    const dlPath = `/agent/channels/${msg.channelId}/attachments/${encodeURIComponent(key)}`;
+    const dlPath = `/agent/channels/${channelId}/attachments/${encodeURIComponent(key)}`;
     const dl = await fetch(`${API_BASE}${dlPath}`, {
       headers: { 'Authorization': `Bearer agent:${agentKey}` },
     });
@@ -100,8 +104,8 @@ async function transcribeAudioMessage(
       return '';
     }
     const bytes = new Uint8Array(await dl.arrayBuffer());
-    const mimeType = msg.metadata?.mimeType || dl.headers.get('Content-Type') || 'audio/webm';
-    const filename = (msg.content && msg.content.trim()) || 'voice';
+    const mimeType = mimeHint || dl.headers.get('Content-Type') || 'audio/webm';
+    const filename = (filenameHint && filenameHint.trim()) || 'voice';
 
     // 2. POST to the local ASR (OpenAI-compatible multipart). This is the only
     //    LAN-only hop — works because the plugin runs inside the LAN.
@@ -112,7 +116,7 @@ async function transcribeAudioMessage(
 
     const asr = await fetch(asrUrl, { method: 'POST', body: form });
     if (!asr.ok) {
-      console.error(`[maicenter] ASR error ${asr.status} for ${key}`);
+      console.error(`[maicenter] ASR error ${asr.status} for ${key} (model ${asrModel})`);
       return '';
     }
     const ct = asr.headers.get('Content-Type') || '';
@@ -127,6 +131,49 @@ async function transcribeAudioMessage(
   } catch (e: any) {
     console.error('[maicenter] transcribe error:', e?.message || e);
     return '';
+  }
+}
+
+// Convenience wrapper for the auto-transcribe path (default model, message obj).
+async function transcribeAudioMessage(
+  agentKey: string,
+  msg: MaicenterMessage,
+  asrUrl: string,
+  asrModel: string,
+): Promise<string> {
+  const key = msg.metadata?.key;
+  if (!key) return '';
+  return transcribeAudioByKey(
+    agentKey, msg.channelId, key,
+    msg.content, msg.metadata?.mimeType, asrUrl, asrModel,
+  );
+}
+
+// Write a transcript back to the server so every human in the channel can read
+// it. The server merges it into metadata.transcripts[model] and clears the
+// model from the pending queue. Best-effort: logs on failure, never throws.
+async function writeTranscriptBack(
+  agentKey: string,
+  channelId: string,
+  messageId: string,
+  model: string,
+  text: string,
+): Promise<void> {
+  try {
+    const resp = await fetch(
+      `${API_BASE}/agent/channels/${channelId}/messages/${messageId}/transcript`,
+      {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer agent:${agentKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, text }),
+      },
+    );
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      console.error(`[maicenter] transcript writeback failed ${resp.status} for ${messageId} (${model}): ${t}`);
+    }
+  } catch (e: any) {
+    console.error('[maicenter] transcript writeback error:', e?.message || e);
   }
 }
 
@@ -231,6 +278,12 @@ export function createMaicenterPolling(ctx: any, agentKey: string, config: any) 
       if (transcript) {
         msg.content = transcript;
         if (msg.metadata) msg.metadata.transcript = transcript;
+        // Write the default-model transcript back so every human in the channel
+        // can read it in the UI (not just this agent's LLM). Fire-and-forget;
+        // failures are logged inside writeTranscriptBack.
+        if (!msg.metadata?.transcripts?.[asrModel]) {
+          writeTranscriptBack(agentKey, msg.channelId, msg.id, asrModel, transcript);
+        }
       } else {
         msg.content = '[语音消息无法转写]';
       }
@@ -401,9 +454,59 @@ export function createMaicenterPolling(ctx: any, agentKey: string, config: any) 
     if (timer && typeof (timer as any).unref === 'function') (timer as any).unref();
   }
 
-  function stop() { if (timer) clearTimeout(timer); }
+  // --- On-demand transcription queue ---
+  // Humans can request an audio message be (re-)transcribed with a specific
+  // model. The server records pending models in metadata.transcribeRequests;
+  // we poll a dedicated endpoint, run each requested model on the LAN ASR, and
+  // write the result back (which also clears the pending entry). Runs on its own
+  // slower cadence so it never perturbs the main message loop.
+  const QUEUE_INTERVAL = 8_000;
+  let queueTimer: ReturnType<typeof setTimeout> | null = null;
+  let queueBusy = false;
+
+  async function pollTranscribeQueue() {
+    if (queueBusy) { scheduleQueue(); return; }
+    queueBusy = true;
+    try {
+      const data = await apiGet(agentKey, '/agent/channels/transcribe-queue');
+      const items = (data && Array.isArray(data.items)) ? data.items : [];
+      for (const item of items) {
+        const { channelId, messageId, key, mimeType, models } = item;
+        if (!channelId || !messageId || !key || !Array.isArray(models)) continue;
+        for (const model of models) {
+          const text = await transcribeAudioByKey(
+            agentKey, channelId, key, 'voice', mimeType || undefined, asrUrl, model,
+          );
+          if (text) {
+            await writeTranscriptBack(agentKey, channelId, messageId, model, text);
+          } else {
+            // Don't clear the pending entry on failure — surface it and let it
+            // retry on a later queue poll. Avoid hammering by logging once here.
+            console.error(`[maicenter] queue transcription empty for ${messageId} (${model})`);
+          }
+        }
+      }
+    } catch (e: any) {
+      console.error('[maicenter] transcribe-queue poll error:', e?.message || e);
+    } finally {
+      queueBusy = false;
+      scheduleQueue();
+    }
+  }
+
+  function scheduleQueue() {
+    if (queueTimer) clearTimeout(queueTimer);
+    queueTimer = setTimeout(pollTranscribeQueue, QUEUE_INTERVAL);
+    if (queueTimer && typeof (queueTimer as any).unref === 'function') (queueTimer as any).unref();
+  }
+
+  function stop() {
+    if (timer) clearTimeout(timer);
+    if (queueTimer) clearTimeout(queueTimer);
+  }
 
   poll();
+  pollTranscribeQueue();
   return stop;
 }
 
