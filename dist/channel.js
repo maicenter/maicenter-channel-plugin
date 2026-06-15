@@ -28,6 +28,83 @@ let msgCounter = 0;
 function generateMessageSid() {
     return `mc_${Date.now()}_${++msgCounter}`;
 }
+// The text-to-image skill can't know the current channelId or hold the agent key,
+// so it can't post an image itself. Instead it emits a machine-readable marker in
+// its reply text naming the local PNG it produced; the plugin (which owns both the
+// agent key and the channelId, via the deliver closure) detects the marker, uploads
+// the bytes to R2, and posts a real contentType:'image' message. The marker is then
+// stripped from the text. Contract documented in the skill's SKILL.md.
+//   [[MAICENTER_IMAGE:/abs/path/to.png]]
+const IMAGE_MARKER_RE = /\[\[MAICENTER_IMAGE:([^\]]+)\]\]/g;
+function extractImageMarkers(text) {
+    const paths = [];
+    let m;
+    IMAGE_MARKER_RE.lastIndex = 0;
+    while ((m = IMAGE_MARKER_RE.exec(text)) !== null) {
+        const p = m[1].trim();
+        if (p)
+            paths.push(p);
+    }
+    const cleaned = text.replace(IMAGE_MARKER_RE, '').replace(/\n{3,}/g, '\n\n').trim();
+    return { cleaned, paths };
+}
+function mimeForPath(p) {
+    const lower = p.toLowerCase();
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg'))
+        return { mime: 'image/jpeg', ext: 'jpg' };
+    if (lower.endsWith('.webp'))
+        return { mime: 'image/webp', ext: 'webp' };
+    if (lower.endsWith('.gif'))
+        return { mime: 'image/gif', ext: 'gif' };
+    return { mime: 'image/png', ext: 'png' };
+}
+// Read a local image file, upload it to R2 via the agent attachment endpoint, and
+// post a contentType:'image' message into the channel. Best-effort: logs and
+// returns false on any failure so a flaky image hop never crashes the reply path.
+// Uses dynamic require('fs') so this stays a no-op cost on hosts without images.
+async function uploadAndSendImage(agentKey, channelId, filePath) {
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const fs = require('fs');
+        if (!fs.existsSync(filePath)) {
+            console.error(`[maicenter] image marker file missing: ${filePath}`);
+            return false;
+        }
+        const data = fs.readFileSync(filePath);
+        const { mime, ext } = mimeForPath(filePath);
+        const base64 = data.toString('base64');
+        // 1. Upload bytes to R2, get a channel-scoped key.
+        const upResp = await fetch(`${API_BASE}/agent/channels/${channelId}/attachments`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer agent:${agentKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_base64: base64, mimeType: mime, ext }),
+        });
+        if (!upResp.ok) {
+            const t = await upResp.text().catch(() => '');
+            console.error(`[maicenter] image upload failed ${upResp.status}: ${t}`);
+            return false;
+        }
+        const up = await upResp.json().catch(() => null);
+        const key = up?.key;
+        if (!key) {
+            console.error('[maicenter] image upload returned no key');
+            return false;
+        }
+        // 2. Post the image message (content = filename caption; renderer keys off
+        //    contentType:'image' + metadata.key).
+        const filename = filePath.split('/').pop() || `image.${ext}`;
+        await apiPost(agentKey, `/agent/channels/${channelId}/messages`, {
+            content: filename,
+            contentType: 'image',
+            metadata: { key, mimeType: up.mimeType || mime, size: up.size, filename },
+        });
+        return true;
+    }
+    catch (e) {
+        console.error('[maicenter] uploadAndSendImage error:', e?.message || e);
+        return false;
+    }
+}
 // Download an audio attachment (agent-authenticated) by R2 key and transcribe it
 // on the local LAN ASR with the given model. Returns the transcript text, or ''
 // on any failure (callers fall back so a flaky ASR never drops the message).
@@ -272,8 +349,20 @@ export function createMaicenterPolling(ctx, agentKey, config) {
         const { dispatcher, replyOptions, markDispatchIdle } = cr.reply.createReplyDispatcherWithTyping({
             deliver: async (payload) => {
                 const text = payload?.text || '';
-                if (text.trim()) {
-                    await apiPost(agentKey, `/agent/channels/${channelId}/messages`, { content: text });
+                // The text-to-image skill embeds [[MAICENTER_IMAGE:/path]] markers naming
+                // local PNGs it produced. Pull them out, post each as a real image message
+                // (upload to R2 -> contentType:'image'), then send the remaining text. If
+                // an image hop fails we keep the original text so the user still gets a
+                // reply (which mentions the local path) rather than silence.
+                const { cleaned, paths } = extractImageMarkers(text);
+                let anyImageSent = false;
+                for (const p of paths) {
+                    const ok = await uploadAndSendImage(agentKey, channelId, p);
+                    anyImageSent = anyImageSent || ok;
+                }
+                const outText = (paths.length > 0 && anyImageSent) ? cleaned : text;
+                if (outText.trim()) {
+                    await apiPost(agentKey, `/agent/channels/${channelId}/messages`, { content: outText });
                 }
             },
             onError: (err) => {
