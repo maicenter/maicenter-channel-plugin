@@ -13,6 +13,14 @@ const ACTIVE_TIMEOUT = 300_000;
 const DEFAULT_ASR_URL = 'http://192.168.12.193:8084/v1/audio/transcriptions';
 const DEFAULT_ASR_MODEL = 'paraformer-zh';
 
+// Local LAN text-to-image (SANA 1.5 on the DGX Spark, port 8083). Same LAN-only
+// reasoning as the ASR: the plugin runs inside the LAN and reaches it directly;
+// the Cloudflare Worker cannot. Overridable via config.t2iUrl. We call SANA with
+// return_base64 so we get the image bytes back over HTTP — the server writes the
+// PNG to ITS OWN disk (the GPU host), which the plugin host (ProClaw) cannot read,
+// so a file path is useless cross-host; base64 over HTTP is the portable channel.
+const DEFAULT_T2I_URL = 'http://192.168.12.193:8083/generate';
+
 interface MaicenterMessage {
   id: string;
   channelId: string;
@@ -79,60 +87,92 @@ function generateMessageSid(): string {
   return `mc_${Date.now()}_${++msgCounter}`;
 }
 
-// The text-to-image skill can't know the current channelId or hold the agent key,
-// so it can't post an image itself. Instead it emits a machine-readable marker in
-// its reply text naming the local PNG it produced; the plugin (which owns both the
-// agent key and the channelId, via the deliver closure) detects the marker, uploads
-// the bytes to R2, and posts a real contentType:'image' message. The marker is then
-// stripped from the text. Contract documented in the skill's SKILL.md.
-//   [[MAICENTER_IMAGE:/abs/path/to.png]]
-const IMAGE_MARKER_RE = /\[\[MAICENTER_IMAGE:([^\]]+)\]\]/g;
+// The text-to-image skill can't know the current channelId, hold the agent key,
+// or reach R2 — and the SANA image server writes its PNG to the GPU host's own
+// disk, which the plugin host (ProClaw) cannot read. So the skill cannot deliver
+// an image itself. Instead it emits a machine-readable marker carrying just the
+// PROMPT; the plugin (which owns the agent key + channelId via the deliver
+// closure, and is on the LAN) calls SANA with return_base64, uploads the bytes to
+// R2, and posts a real contentType:'image' message. The marker is then stripped
+// from the text. Contract documented in the skill's SKILL.md.
+//   [[MAICENTER_IMAGE_PROMPT: a watercolor crab wearing a hat]]
+const IMAGE_PROMPT_MARKER_RE = /\[\[MAICENTER_IMAGE_PROMPT:([^\]]+)\]\]/g;
+// Legacy/stray path-form marker the model sometimes emits ([[MAICENTER_IMAGE:/tmp/x.png]]).
+// The file lives on the GPU host, not here, so we can't deliver from it — but we
+// MUST strip it so the raw marker never leaks into the chat. We turn a path into a
+// usable prompt by taking the basename, stripping the extension, and replacing
+// separators with spaces (e.g. /tmp/t2i_cartoon_crab_beach.png -> "cartoon crab beach").
+const IMAGE_PATH_MARKER_RE = /\[\[MAICENTER_IMAGE:([^\]]+)\]\]/g;
 
-function extractImageMarkers(text: string): { cleaned: string; paths: string[] } {
-  const paths: string[] = [];
+function pathToPrompt(p: string): string {
+  const base = (p.split('/').pop() || p).replace(/\.[a-z0-9]+$/i, '');
+  return base.replace(/^t2i[_-]?/i, '').replace(/[_-]+/g, ' ').trim();
+}
+
+function extractImagePrompts(text: string): { cleaned: string; prompts: string[] } {
+  const prompts: string[] = [];
   let m: RegExpExecArray | null;
-  IMAGE_MARKER_RE.lastIndex = 0;
-  while ((m = IMAGE_MARKER_RE.exec(text)) !== null) {
+  IMAGE_PROMPT_MARKER_RE.lastIndex = 0;
+  while ((m = IMAGE_PROMPT_MARKER_RE.exec(text)) !== null) {
     const p = m[1].trim();
-    if (p) paths.push(p);
+    if (p) prompts.push(p);
   }
-  const cleaned = text.replace(IMAGE_MARKER_RE, '').replace(/\n{3,}/g, '\n\n').trim();
-  return { cleaned, paths };
+  // Fallback: legacy path-form markers. Derive a prompt from the filename so we
+  // still produce an image rather than dropping the request, and always strip.
+  IMAGE_PATH_MARKER_RE.lastIndex = 0;
+  while ((m = IMAGE_PATH_MARKER_RE.exec(text)) !== null) {
+    const derived = pathToPrompt(m[1].trim());
+    if (derived) prompts.push(derived);
+  }
+  const cleaned = text
+    .replace(IMAGE_PROMPT_MARKER_RE, '')
+    .replace(IMAGE_PATH_MARKER_RE, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return { cleaned, prompts };
 }
 
-function mimeForPath(p: string): { mime: string; ext: string } {
-  const lower = p.toLowerCase();
-  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return { mime: 'image/jpeg', ext: 'jpg' };
-  if (lower.endsWith('.webp')) return { mime: 'image/webp', ext: 'webp' };
-  if (lower.endsWith('.gif')) return { mime: 'image/gif', ext: 'gif' };
-  return { mime: 'image/png', ext: 'png' };
-}
-
-// Read a local image file, upload it to R2 via the agent attachment endpoint, and
-// post a contentType:'image' message into the channel. Best-effort: logs and
-// returns false on any failure so a flaky image hop never crashes the reply path.
-// Uses dynamic require('fs') so this stays a no-op cost on hosts without images.
-async function uploadAndSendImage(
+// Generate an image on the LAN SANA server (base64 over HTTP), upload it to R2 via
+// the agent attachment endpoint, and post a contentType:'image' message into the
+// channel. Best-effort: logs and returns false on any failure so a flaky image
+// hop never crashes the reply path.
+async function generateUploadAndSendImage(
   agentKey: string,
   channelId: string,
-  filePath: string,
+  prompt: string,
+  t2iUrl: string,
 ): Promise<boolean> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const fs = require('fs') as typeof import('fs');
-    if (!fs.existsSync(filePath)) {
-      console.error(`[maicenter] image marker file missing: ${filePath}`);
+    // 1. Generate on SANA. Ask for base64 in the response — the PNG file SANA
+    //    writes lives on the GPU host, not here, so we can't read it by path.
+    const gen = await fetch(t2iUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        width: 1024,
+        height: 1024,
+        steps: 20,
+        guidance: 4.5,
+        return_base64: true,
+      }),
+    });
+    if (!gen.ok) {
+      console.error(`[maicenter] t2i generate failed ${gen.status} for prompt: ${prompt.slice(0, 60)}`);
       return false;
     }
-    const data = fs.readFileSync(filePath);
-    const { mime, ext } = mimeForPath(filePath);
-    const base64 = data.toString('base64');
+    const gj: any = await gen.json().catch(() => null);
+    const b64: string = (gj && (gj.image_base64 || gj.base64)) || '';
+    if (!b64) {
+      console.error('[maicenter] t2i returned no image_base64');
+      return false;
+    }
 
-    // 1. Upload bytes to R2, get a channel-scoped key.
+    // 2. Upload bytes to R2, get a channel-scoped key.
     const upResp = await fetch(`${API_BASE}/agent/channels/${channelId}/attachments`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer agent:${agentKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_base64: base64, mimeType: mime, ext }),
+      body: JSON.stringify({ image_base64: b64, mimeType: 'image/png', ext: 'png' }),
     });
     if (!upResp.ok) {
       const t = await upResp.text().catch(() => '');
@@ -146,17 +186,16 @@ async function uploadAndSendImage(
       return false;
     }
 
-    // 2. Post the image message (content = filename caption; renderer keys off
-    //    contentType:'image' + metadata.key).
-    const filename = filePath.split('/').pop() || `image.${ext}`;
+    // 3. Post the image message (renderer keys off contentType:'image' +
+    //    metadata.key; content is a short caption fallback).
     await apiPost(agentKey, `/agent/channels/${channelId}/messages`, {
-      content: filename,
+      content: prompt.slice(0, 120),
       contentType: 'image',
-      metadata: { key, mimeType: up.mimeType || mime, size: up.size, filename },
+      metadata: { key, mimeType: up.mimeType || 'image/png', size: up.size, prompt: prompt.slice(0, 200) },
     });
     return true;
   } catch (e: any) {
-    console.error('[maicenter] uploadAndSendImage error:', e?.message || e);
+    console.error('[maicenter] generateUploadAndSendImage error:', e?.message || e);
     return false;
   }
 }
@@ -270,6 +309,7 @@ export function createMaicenterPolling(ctx: any, agentKey: string, config: any) 
   const accountId = ctx.accountId || 'default';
   const asrUrl = config.asrUrl || DEFAULT_ASR_URL;
   const asrModel = config.asrModel || DEFAULT_ASR_MODEL;
+  const t2iUrl = config.t2iUrl || DEFAULT_T2I_URL;
 
   // Resolve our own agent id once so we can spot mentions targeted at us
   // (and apply the user's preferredModel for our dispatch).
@@ -435,18 +475,18 @@ export function createMaicenterPolling(ctx: any, agentKey: string, config: any) 
     const { dispatcher, replyOptions, markDispatchIdle } = cr.reply.createReplyDispatcherWithTyping({
       deliver: async (payload: any) => {
         const text = payload?.text || '';
-        // The text-to-image skill embeds [[MAICENTER_IMAGE:/path]] markers naming
-        // local PNGs it produced. Pull them out, post each as a real image message
-        // (upload to R2 -> contentType:'image'), then send the remaining text. If
-        // an image hop fails we keep the original text so the user still gets a
-        // reply (which mentions the local path) rather than silence.
-        const { cleaned, paths } = extractImageMarkers(text);
+        // The text-to-image skill embeds [[MAICENTER_IMAGE_PROMPT: ...]] markers
+        // carrying the prompt. For each, generate on the LAN SANA server, upload to
+        // R2, and post a real contentType:'image' message; then send the remaining
+        // text. If an image hop fails we keep the original text so the user still
+        // gets a reply rather than silence.
+        const { cleaned, prompts } = extractImagePrompts(text);
         let anyImageSent = false;
-        for (const p of paths) {
-          const ok = await uploadAndSendImage(agentKey, channelId, p);
+        for (const p of prompts) {
+          const ok = await generateUploadAndSendImage(agentKey, channelId, p, t2iUrl);
           anyImageSent = anyImageSent || ok;
         }
-        const outText = (paths.length > 0 && anyImageSent) ? cleaned : text;
+        const outText = (prompts.length > 0 && anyImageSent) ? cleaned : text;
         if (outText.trim()) {
           await apiPost(agentKey, `/agent/channels/${channelId}/messages`, { content: outText });
         }
