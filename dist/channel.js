@@ -46,17 +46,26 @@ function generateMessageSid() {
 //   [[MAICENTER_IMAGE_PROMPT: a watercolor crab wearing a hat]]
 const IMAGE_PROMPT_MARKER_RE = /\[\[MAICENTER_IMAGE_PROMPT:([^\]]+)\]\]/g;
 // Legacy/stray path-form marker the model sometimes emits ([[MAICENTER_IMAGE:/tmp/x.png]]).
-// The file lives on the GPU host, not here, so we can't deliver from it — but we
-// MUST strip it so the raw marker never leaks into the chat. We turn a path into a
-// usable prompt by taking the basename, stripping the extension, and replacing
-// separators with spaces (e.g. /tmp/t2i_cartoon_crab_beach.png -> "cartoon crab beach").
+// gemma-4-12b stubbornly keeps emitting this path form instead of the PROMPT
+// form. The file lives on the GPU host, not here, so we can't deliver from it —
+// but we MUST strip it so the raw marker never leaks into the chat, and we still
+// want to produce an image. The basename (e.g. "t2i_fox_cartoon.png") is a crude,
+// usually-English degradation of what the user actually asked for, so we DO NOT
+// use it as the prompt when we have the user's real request available. Instead the
+// deliver callback falls back to the user's original message text (see below);
+// pathToPrompt is only a last-ditch fallback when even that is unavailable.
 const IMAGE_PATH_MARKER_RE = /\[\[MAICENTER_IMAGE:([^\]]+)\]\]/g;
 function pathToPrompt(p) {
     const base = (p.split('/').pop() || p).replace(/\.[a-z0-9]+$/i, '');
     return base.replace(/^t2i[_-]?/i, '').replace(/[_-]+/g, ' ').trim();
 }
+// Result of scanning a reply for image markers. `prompts` are explicit, trusted
+// prompts from the PROMPT-form marker. `pathMarkers` are legacy path-form markers
+// that carried no real prompt — for these the deliver callback decides the prompt
+// (user's original message first, basename-derived only as last resort).
 function extractImagePrompts(text) {
     const prompts = [];
+    const pathMarkers = [];
     let m;
     IMAGE_PROMPT_MARKER_RE.lastIndex = 0;
     while ((m = IMAGE_PROMPT_MARKER_RE.exec(text)) !== null) {
@@ -64,20 +73,29 @@ function extractImagePrompts(text) {
         if (p)
             prompts.push(p);
     }
-    // Fallback: legacy path-form markers. Derive a prompt from the filename so we
-    // still produce an image rather than dropping the request, and always strip.
+    // Legacy path-form markers: collect them so we still generate an image and
+    // always strip the raw marker, but defer prompt selection to the caller.
     IMAGE_PATH_MARKER_RE.lastIndex = 0;
     while ((m = IMAGE_PATH_MARKER_RE.exec(text)) !== null) {
-        const derived = pathToPrompt(m[1].trim());
-        if (derived)
-            prompts.push(derived);
+        pathMarkers.push(m[1].trim());
     }
     const cleaned = text
         .replace(IMAGE_PROMPT_MARKER_RE, '')
         .replace(IMAGE_PATH_MARKER_RE, '')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
-    return { cleaned, prompts };
+    return { cleaned, prompts, pathMarkers };
+}
+// Pick the prompt for a legacy path-form marker. Priority:
+//   1. user's original message text this turn (what they actually asked for) —
+//      passed unmodified to SANA, which handles Chinese + instruction words fine;
+//   2. basename-derived prompt as a last-ditch fallback (crude English, used only
+//      when we somehow have no user text, e.g. an agent-initiated turn).
+function promptForPathMarker(pathArg, userText) {
+    const ut = (userText || '').trim();
+    if (ut)
+        return ut;
+    return pathToPrompt(pathArg);
 }
 // Generate an image on the LAN SANA server (base64 over HTTP), upload it to R2 via
 // the agent attachment endpoint, and post a contentType:'image' message into the
@@ -390,13 +408,28 @@ export function createMaicenterPolling(ctx, agentKey, config) {
                 // R2, and post a real contentType:'image' message; then send the remaining
                 // text. If an image hop fails we keep the original text so the user still
                 // gets a reply rather than silence.
-                const { cleaned, prompts } = extractImagePrompts(text);
+                //
+                // Prompt priority (see promptForPathMarker): explicit PROMPT markers win;
+                // for legacy path-form markers (gemma keeps emitting these), we fall back
+                // to the user's ORIGINAL message this turn rather than the crude
+                // basename-derived English, so "森林里的卡通小狐狸" reaches SANA verbatim
+                // instead of being degraded to "fox cartoon". msg.content is the clean
+                // user text (preamble is only added to msgCtx.Body, never to msg.content).
+                const { cleaned, prompts, pathMarkers } = extractImagePrompts(text);
+                const effectivePrompts = [
+                    ...prompts,
+                    ...pathMarkers.map((pm) => promptForPathMarker(pm, msg.content)),
+                ].filter((p) => p && p.trim());
                 let anyImageSent = false;
-                for (const p of prompts) {
+                for (const p of effectivePrompts) {
                     const ok = await generateUploadAndSendImage(agentKey, channelId, p, t2iUrl);
                     anyImageSent = anyImageSent || ok;
                 }
-                const outText = (prompts.length > 0 && anyImageSent) ? cleaned : text;
+                // Always send the cleaned text when any marker was present, so a raw
+                // marker NEVER leaks into the chat — even if image generation failed
+                // (cleaned still carries whatever real prose the reply had around it).
+                const hadMarker = prompts.length > 0 || pathMarkers.length > 0;
+                const outText = hadMarker ? cleaned : text;
                 if (outText.trim()) {
                     await apiPost(agentKey, `/agent/channels/${channelId}/messages`, { content: outText });
                 }
