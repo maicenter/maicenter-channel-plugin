@@ -336,6 +336,56 @@ export function createMaicenterPolling(ctx: any, agentKey: string, config: any) 
     if (p?.id) myAgentId = p.id;
   }).catch(() => {});
 
+  // --- Transcription capability gate (AUTHORITATIVE) ---
+  // We only transcribe voice messages if THIS agent has a `voice`-type model
+  // service registered on mAICenter (e.g. Pro虾's "普通话语音识别 (ASR)"). An
+  // agent without an ASR service must never transcribe — no download, no LAN ASR
+  // call, no write-back. We query the public /models endpoint filtered to our own
+  // owner+type and cache the result, refreshing periodically so a newly-added (or
+  // removed) service is picked up without a restart. We do NOT query per message.
+  //
+  // NOTE on visibility: the plugin authenticates with an `agent:` token, which the
+  // /models endpoint does not treat as the owner (owner-detection uses user auth).
+  // So we see only status='active' voice services here — exactly the right gate:
+  // an unlisted/paused service shouldn't enable transcription either. Pro虾's ASR
+  // is active, so it is visible.
+  let hasVoiceModel: boolean | null = null; // null = not resolved yet
+  const VOICE_CAP_REFRESH_MS = 10 * 60 * 1000;
+
+  async function refreshVoiceCapability(): Promise<void> {
+    if (!myAgentId) {
+      // Agent id not resolved yet — try to resolve it first so the gate works
+      // even if the profile call above is still in flight.
+      try {
+        const p = await apiGet(agentKey, '/agent/profile');
+        if (p?.id) myAgentId = p.id;
+      } catch { /* keep hasVoiceModel as-is; retried next refresh */ }
+    }
+    if (!myAgentId) return;
+    try {
+      const data = await apiGet(
+        agentKey,
+        `/models?owner=${encodeURIComponent(myAgentId)}&type=voice`,
+      );
+      const list = Array.isArray(data?.models) ? data.models : [];
+      // Defensive: also enforce type==='voice' in JS in case the API ever ignores
+      // the filter, and require the service to be active (shared).
+      const has = list.some(
+        (m: any) => m && m.type === 'voice' && (m.status === 'active' || m.shared === true),
+      );
+      hasVoiceModel = has;
+    } catch (e: any) {
+      // On a query failure, do NOT flip a previously-known value. If we've never
+      // resolved it, leave it null (transcription stays off until we know).
+      console.error('[maicenter] voice-capability check failed:', e?.message || e);
+    }
+  }
+
+  // Resolve capability promptly at startup, then refresh on a slow timer.
+  refreshVoiceCapability();
+  const voiceCapTimer = setInterval(refreshVoiceCapability, VOICE_CAP_REFRESH_MS);
+  if (typeof (voiceCapTimer as any).unref === 'function') (voiceCapTimer as any).unref();
+
   // Per-channel buffer of silently-delivered messages — group/friend chat that
   // wasn't @-addressed to us. We flush this buffer as a context preamble in
   // front of the next addressed message so the LLM sees "刚才" naturally.
@@ -415,18 +465,27 @@ export function createMaicenterPolling(ctx: any, agentKey: string, config: any) 
     // typed message. On any ASR failure, fall back to a readable placeholder so
     // the message is never silently dropped.
     if (msg.contentType === 'audio' && msg.metadata?.key && !msg.metadata?.transcript) {
-      const transcript = await transcribeAudioMessage(agentKey, msg, asrUrl, asrModel);
-      if (transcript) {
-        msg.content = transcript;
-        if (msg.metadata) msg.metadata.transcript = transcript;
-        // Write the default-model transcript back so every human in the channel
-        // can read it in the UI (not just this agent's LLM). Fire-and-forget;
-        // failures are logged inside writeTranscriptBack.
-        if (!msg.metadata?.transcripts?.[asrModel]) {
-          writeTranscriptBack(agentKey, msg.channelId, msg.id, asrModel, transcript);
-        }
+      if (hasVoiceModel !== true) {
+        // This agent has no `voice` model service → transcription is not offered.
+        // Don't download, don't call the LAN ASR, don't write back. Keep the
+        // message as a readable placeholder so the LLM dispatch path still has
+        // something coherent (the audio itself is unreadable to a text model).
+        console.log(`[maicenter] no voice model for this agent — skipping transcription of ${msg.id}`);
+        msg.content = '[语音消息]';
       } else {
-        msg.content = '[语音消息无法转写]';
+        const transcript = await transcribeAudioMessage(agentKey, msg, asrUrl, asrModel);
+        if (transcript) {
+          msg.content = transcript;
+          if (msg.metadata) msg.metadata.transcript = transcript;
+          // Write the default-model transcript back so every human in the channel
+          // can read it in the UI (not just this agent's LLM). Fire-and-forget;
+          // failures are logged inside writeTranscriptBack.
+          if (!msg.metadata?.transcripts?.[asrModel]) {
+            writeTranscriptBack(agentKey, msg.channelId, msg.id, asrModel, transcript);
+          }
+        } else {
+          msg.content = '[语音消息无法转写]';
+        }
       }
     }
 
@@ -634,6 +693,10 @@ export function createMaicenterPolling(ctx: any, agentKey: string, config: any) 
 
   async function pollTranscribeQueue() {
     if (queueBusy) { scheduleQueue(); return; }
+    // Gate: an agent without a voice model service never services the on-demand
+    // transcription queue either. Skip the whole poll (no API hit beyond this
+    // early return) until/unless this agent gains a voice model.
+    if (hasVoiceModel !== true) { scheduleQueue(); return; }
     queueBusy = true;
     try {
       const data = await apiGet(agentKey, '/agent/channels/transcribe-queue');
@@ -671,6 +734,7 @@ export function createMaicenterPolling(ctx: any, agentKey: string, config: any) 
   function stop() {
     if (timer) clearTimeout(timer);
     if (queueTimer) clearTimeout(queueTimer);
+    clearInterval(voiceCapTimer);
   }
 
   poll();
