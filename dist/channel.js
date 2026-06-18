@@ -377,7 +377,18 @@ export function createMaicenterPolling(ctx, agentKey, config) {
         // typed message. On any ASR failure, fall back to a readable placeholder so
         // the message is never silently dropped.
         if (msg.contentType === 'audio' && msg.metadata?.key && !msg.metadata?.transcript) {
-            if (hasVoiceModel !== true) {
+            // Two gates, BOTH must pass to transcribe:
+            //   1. hasVoiceModel — this agent offers an ASR (voice) model service.
+            //   2. msg.transcriptionEnabled — the channel's transcription switch is ON
+            //      (owner/participant-set; defaults OFF). The server stamps this flag on
+            //      every polled message so we never need a per-message API call.
+            if (msg.transcriptionEnabled !== true) {
+                // Channel transcription switch is OFF (or this API doesn't send the flag).
+                // Keep the audio as-is; do not download/transcribe/write back.
+                console.log(`[maicenter] channel transcription OFF — skipping transcription of ${msg.id}`);
+                msg.content = '[语音消息]';
+            }
+            else if (hasVoiceModel !== true) {
                 // This agent has no `voice` model service → transcription is not offered.
                 // Don't download, don't call the LAN ASR, don't write back. Keep the
                 // message as a readable placeholder so the LLM dispatch path still has
